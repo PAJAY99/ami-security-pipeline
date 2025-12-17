@@ -1,0 +1,65 @@
+name: AMI Security Gate (Tenable + CIS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ami_id:
+        description: "Candidate AMI ID"
+        required: true
+      scan_id:
+        description: "Tenable Scan ID"
+        required: true
+
+env:
+  CIS_FAILED_MAX: ${{ secrets.CIS_FAILED_MAX }}
+  CRITICAL_VULN_MAX: ${{ secrets.CRITICAL_VULN_MAX }}
+  TENABLE_ACCESS_KEY: ${{ secrets.TENABLE_ACCESS_KEY }}
+  TENABLE_SECRET_KEY: ${{ secrets.TENABLE_SECRET_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  security-gate:
+    name: Tenable Security Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for Tenable Scan to Complete
+        run: |
+          bash scripts/wait_for_scan.sh "${{ github.event.inputs.scan_id }}"
+
+      - name: Fetch Critical Vulnerabilities
+        run: |
+          bash scripts/fetch_vulns.sh "${{ github.event.inputs.scan_id }}" > critical.txt
+          echo "CRITICAL=$(cat critical.txt)" >> $GITHUB_ENV
+
+      - name: Fetch CIS Failed Controls
+        run: |
+          bash scripts/fetch_cis.sh "${{ github.event.inputs.scan_id }}" > cis_failed.txt
+          echo "CIS_FAILED=$(cat cis_failed.txt)" >> $GITHUB_ENV
+
+      - name: Apply Security Gate
+        run: |
+          bash scripts/gate_decision.sh
+
+      - name: Approve AMI (Only if Passed)
+        if: success()
+        run: |
+          aws ec2 create-tags \
+            --resources "${{ github.event.inputs.ami_id }}" \
+            --tags Key=ami_status,Value=approved
+
+      - name: Reject AMI (Only if Failed)
+        if: failure()
+        run: |
+          aws ec2 create-tags \
+            --resources "${{ github.event.inputs.ami_id }}" \
+            --tags Key=ami_status,Value=rejected
